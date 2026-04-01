@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AP GIS: Predictive Drought Dashboard</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js"></script>
+    <style>
+        :root { --primary: #1a252f; --accent: #2980b9; --bg: #f4f7f6; --white: #ffffff; --predict: #8e44ad; }
+        body { font-family: 'Segoe UI', sans-serif; background: var(--bg); margin: 0; padding: 20px; color: #2c3e50; min-height: 2600px; }
+        .container { max-width: 1600px; margin: auto; }
+        header { background: var(--primary); color: white; padding: 25px; border-radius: 12px; margin-bottom: 20px; text-align: center; }
+        .upload-section { display: flex; gap: 20px; background: var(--white); padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .filter-bar { 
+            display: grid; grid-template-columns: 1.2fr 1.2fr 1fr 1fr 0.8fr; gap: 15px; 
+            background: #ecf0f1; padding: 20px; border-radius: 10px; position: sticky; top: 10px; z-index: 1000; box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+        }
+        .year-icon-bar { display: flex; flex-wrap: wrap; gap: 10px; padding: 15px; background: var(--white); border-radius: 10px; margin-bottom: 20px; border: 1px solid #ddd; align-items: center; }
+        .year-btn { padding: 10px 18px; border: 1px solid var(--accent); border-radius: 25px; background: white; cursor: pointer; font-weight: bold; transition: 0.3s; }
+        .year-btn.active { background: var(--accent); color: white; }
+        
+        /* New Style for Prediction Buttons */
+        .pred-btn { padding: 10px 18px; border: 2px solid var(--predict); border-radius: 25px; background: white; color: var(--predict); cursor: pointer; font-weight: bold; transition: 0.3s; }
+        .pred-btn.active { background: var(--predict); color: white; box-shadow: 0 0 10px rgba(142, 68, 173, 0.4); }
+        .divider { height: 30px; width: 2px; background: #bdc3c7; margin: 0 10px; }
+
+        .aoi-toggle { display: flex; align-items: center; justify-content: center; background: #2c3e50; color: white; border-radius: 8px; cursor: pointer; font-weight: bold; transition: 0.3s; }
+        .aoi-toggle.active { background: #e74c3c; }
+        .info-card { background: #e1f5fe; border-left: 5px solid var(--accent); padding: 12px; border-radius: 5px; }
+        .dashboard-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 25px; }
+        .chart-card { background: var(--white); padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); border: 1px solid #ddd; }
+        .full-width { grid-column: span 2; }
+        .value-text { font-size: 1.2rem; font-weight: bold; color: var(--accent); }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <h1 id="dashTitle">Andhra Pradesh GIS Predictive Analytics</h1>
+        <p style="margin:5px 0 0 0; opacity: 0.8;">Historical Variability & Machine Learning Forecasts</p>
+    </header>
+
+    <div class="upload-section" id="uploadPanel">
+        <div style="flex:1;"><label><b>1. JSON Data (Include ML columns)</b></label><input type="file" id="dataInput"></div>
+        <div style="flex:1;"><label><b>2. AP Boundaries (GeoJSON)</b></label><input type="file" id="geoInput"></div>
+    </div>
+
+    <div id="mainDashboard" class="hidden">
+        <div class="filter-bar">
+            <div><label>District</label><select id="districtSelect"></select></div>
+            <div><label>Mandal (AOI)</label><select id="mandalSelect"></select></div>
+            <div class="info-card"><label id="rfLabel">Rainfall</label><div id="liveRF" class="value-text">-</div></div>
+            <div class="info-card"><label id="spiLabel">SPI Index</label><div id="liveSPI" class="value-text">-</div></div>
+            <div class="aoi-toggle" id="aoiBtn" onclick="toggleAOI()">🔍 AOI FOCUS: OFF</div>
+        </div>
+
+        <div class="year-icon-bar" id="yearBar"></div>
+
+        <div class="dashboard-grid">
+            <div class="chart-card full-width"><div id="mapChart" style="height: 750px;"></div></div>
+            <div class="chart-card"><div id="spiTrendChart"></div></div>
+            <div class="chart-card"><div id="rainfallTrendChart"></div></div>
+            <div class="chart-card"><div id="corrChart"></div></div>
+            <div class="chart-card"><div id="freqChart"></div></div>
+            <div class="chart-card full-width"><div id="cvChart"></div></div>
+        </div>
+    </div>
+</div>
+
+<script>
+    let rawData = [], geoJSON = null, selectedYear = "2022", isAOIMode = false;
+    let schema = { spi: 'trfspi', rf: 'trf' }; 
+    let histYears = [], predColsSPI = [], predColsRF = [];
+
+    document.getElementById('dataInput').addEventListener('change', (e) => {
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            rawData = JSON.parse(event.target.result);
+            detectSchema();
+            initYearBar();
+            initFilters();
+            document.getElementById('mainDashboard').classList.remove('hidden');
+            document.getElementById('uploadPanel').style.display = 'none';
+        };
+        reader.readAsText(e.target.files[0]);
+    });
+
+    document.getElementById('geoInput').addEventListener('change', (e) => {
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            geoJSON = JSON.parse(event.target.result);
+            updateDashboard(true);
+        };
+        reader.readAsText(e.target.files[0]);
+    });
+
+    function detectSchema() {
+        const keys = Object.keys(rawData[0]);
+        
+        if (keys.some(k => k.startsWith('srfspi'))) {
+            schema = { spi: 'srfspi', rf: 'srf' };
+            document.getElementById('dashTitle').innerText = "AP GIS: Sowing Season & ML Forecasts (SRF)";
+        } else if (keys.some(k => k.startsWith('trfspi'))) {
+            schema = { spi: 'trfspi', rf: 'trf' };
+            document.getElementById('dashTitle').innerText = "AP GIS: Total Rainfall & ML Forecasts (TRF)";
+        }
+
+        // Isolate historical years (e.g., 1988 to 2025)
+        histYears = keys.filter(k => k.startsWith(schema.spi) && !isNaN(k.replace(schema.spi, ''))).map(k => k.replace(schema.spi, '')).sort();
+
+        // Isolate ML Prediction Columns
+        const possiblePreds = ["lstmPredspi", "xgbPredspi", "RFPredspi", "xgboost", "lstm", "RF"];
+        predColsSPI = keys.filter(k => possiblePreds.includes(k) && k.toLowerCase().includes('spi'));
+        predColsRF = keys.filter(k => possiblePreds.includes(k) && !k.toLowerCase().includes('spi'));
+        
+        // Dynamic fallback if names changed slightly
+        if(predColsSPI.length === 0) {
+            predColsSPI = keys.filter(k => k.toLowerCase().includes('pred') && k.toLowerCase().includes('spi'));
+        }
+    }
+
+    function toggleAOI() {
+        isAOIMode = !isAOIMode;
+        const btn = document.getElementById('aoiBtn');
+        btn.innerText = isAOIMode ? "🔍 AOI FOCUS: ON" : "🔍 AOI FOCUS: OFF";
+        btn.classList.toggle('active');
+        updateDashboard(true);
+    }
+
+    function initYearBar() {
+        const bar = document.getElementById('yearBar');
+        selectedYear = histYears[histYears.length - 1]; // Default to latest historical year
+
+        let html = histYears.map(yr => `<button class="year-btn ${yr === selectedYear ? 'active' : ''}" onclick="changeYear(event, '${yr}', false)">${yr}</button>`).join('');
+        
+        if (predColsSPI.length > 0) {
+            html += `<div class="divider"></div><span style="font-weight:bold; color:#8e44ad;">AI FORECASTS:</span>`;
+            html += predColsSPI.map(model => `<button class="pred-btn" onclick="changeYear(event, '${model}', true)">${model.replace('Predspi', '').toUpperCase()}</button>`).join('');
+        }
+        bar.innerHTML = html;
+    }
+
+    function changeYear(e, val, isPred) {
+        selectedYear = val;
+        document.querySelectorAll('.year-btn, .pred-btn').forEach(b => b.classList.remove('active'));
+        e.target.classList.add('active');
+        updateDashboard(false);
+    }
+
+    function initFilters() {
+        const districts = _.uniq(_.map(rawData, 'District')).sort();
+        document.getElementById('districtSelect').innerHTML = districts.map(d => `<option value="${d}">${d}</option>`).join('');
+        document.getElementById('districtSelect').addEventListener('change', () => updateMandalOptions(true));
+        updateMandalOptions(true);
+    }
+
+    function updateMandalOptions(zoom) {
+        const dist = document.getElementById('districtSelect').value;
+        const mandals = _.filter(rawData, {District: dist}).map(m => m.TEHSIL).sort();
+        document.getElementById('mandalSelect').innerHTML = mandals.map(m => `<option value="${m}">${m}</option>`).join('');
+        document.getElementById('mandalSelect').addEventListener('change', () => updateDashboard(true));
+        updateDashboard(zoom);
+    }
+
+    function updateDashboard(doZoom) {
+        const mandalName = document.getElementById('mandalSelect').value;
+        const data = _.find(rawData, {TEHSIL: mandalName});
+        if (!data) return;
+
+        let currentSPIVal, currentRFVal;
+        let isPrediction = predColsSPI.includes(selectedYear);
+
+        if (isPrediction) {
+            currentSPIVal = data[selectedYear];
+            // Match RF prediction if it exists (e.g., if 'lstmPredspi', look for 'lstm')
+            let matchedRF = predColsRF.find(r => selectedYear.toLowerCase().includes(r.toLowerCase())) || "-";
+            currentRFVal = data[matchedRF] !== undefined ? data[matchedRF] : "Forecast";
+            
+            document.getElementById('rfLabel').innerText = `Rainfall (Predicted)`;
+            document.getElementById('spiLabel').innerText = `SPI (${selectedYear.replace('Predspi','').toUpperCase()})`;
+            document.getElementById('liveRF').innerText = isNaN(currentRFVal) ? "N/A" : parseFloat(currentRFVal).toFixed(2) + " mm";
+            document.getElementById('liveSPI').innerText = parseFloat(currentSPIVal).toFixed(2);
+        } else {
+            currentSPIVal = data[schema.spi + selectedYear];
+            currentRFVal = data[schema.rf + selectedYear];
+            document.getElementById('rfLabel').innerText = `Rainfall (${selectedYear})`;
+            document.getElementById('spiLabel').innerText = `SPI (${selectedYear})`;
+            document.getElementById('liveRF').innerText = currentRFVal + " mm";
+            document.getElementById('liveSPI').innerText = parseFloat(currentSPIVal).toFixed(2);
+        }
+
+        // Trend Charts Preparation
+        const years = [], spi = [], rain = [];
+        histYears.forEach(yr => {
+            years.push(yr); 
+            spi.push(data[schema.spi + yr]); 
+            rain.push(data[schema.rf + yr]);
+        });
+
+        // Add Historical Traces
+        const spiData = [{x:years, y:spi, name:'History', type:'scatter', mode:'lines+markers', line:{color:'#e74c3c'}}];
+        const rainData = [{x:years, y:rain, name:'History', type:'bar', marker:{color:'#3498db'}}];
+
+        // Add Prediction Traces (Overlay as Stars at the end)
+        if (predColsSPI.length > 0) {
+            const pX = [], pY = [];
+            predColsSPI.forEach(model => {
+                pX.push(model.replace('Predspi','').toUpperCase() + " (F)");
+                pY.push(data[model]);
+            });
+            spiData.push({
+                x: pX, y: pY, name: 'AI Forecasts', type: 'scatter', mode: 'markers',
+                marker: { size: 14, color: '#8e44ad', symbol: 'star' }
+            });
+        }
+
+        Plotly.newPlot('spiTrendChart', spiData, {title:`SPI Index & Forecasts: ${mandalName}`, yaxis:{range:[-3,3]}});
+        Plotly.newPlot('rainfallTrendChart', rainData, {title:`Rainfall Trend: ${mandalName}`});
+        Plotly.newPlot('corrChart', [{x:rain, y:spi, mode:'markers', marker:{color:'#2c3e50'}}], {title:'Rain-SPI Sensitivity'});
+        Plotly.newPlot('freqChart', [{x:['Normal','Mild','Severe','Extreme'], y:[data.Normal, data['Mild dry'], data.severe, data.Extreme], type:'bar', marker:{color:['#2ecc71','#f1c40f','#e67e22','#c0392b']}}], {title:'Historical Drought Frequency'});
+        
+        drawCV();
+        updateMap(doZoom, data, isPrediction);
+    }
+
+    function updateMap(doZoom, selectedData, isPrediction) {
+        if (!geoJSON) return;
+        const displayData = isAOIMode ? [selectedData] : rawData;
+        
+        const mapZKey = isPrediction ? selectedYear : schema.spi + selectedYear;
+        const hoverLabels = displayData.map(d => `<b>${d.TEHSIL}</b><br>Dist: ${d.District}<br>SPI Value: ${parseFloat(d[mapZKey]).toFixed(2)}`);
+
+        const trace = {
+            type: 'choroplethmapbox', geojson: geoJSON, locations: displayData.map(d => d.Unique_cod),
+            z: displayData.map(d => d[mapZKey]), featureidkey: "properties.Unique_cod",
+            colorscale: [[0, '#8b0000'], [0.25, '#d73027'], [0.45, '#fc8d59'], [0.5, '#ffffbf'], [0.75, '#91bfdb'], [1, '#313695']], 
+            zmin: -3, zmax: 3,
+            text: hoverLabels, hoverinfo: 'text', marker: { opacity: 0.8, line: {width: 0.5, color: 'white'} }
+        };
+
+        let center = {lon: 79.5, lat: 15.8}, zoom = 6;
+        if (doZoom) {
+            const feat = geoJSON.features.find(f => f.properties.Unique_cod === selectedData.Unique_cod);
+            if (feat) {
+                const c = feat.geometry.coordinates[0][0][0] || feat.geometry.coordinates[0][0];
+                center = {lon: c[0], lat: c[1]}; zoom = isAOIMode ? 11 : 9;
+            }
+        }
+
+        const mapTitle = isPrediction ? `<b>Predicted Spatial SPI (${selectedYear.replace('Predspi','').toUpperCase()})</b>` : `<b>${selectedYear} Spatial SPI</b>`;
+
+        Plotly.newPlot('mapChart', [trace], { mapbox: { style: "carto-positron", center, zoom }, margin: {r:0, t:40, l:0, b:0}, title: mapTitle }).then(gd => {
+            gd.on('plotly_click', (d) => {
+                const clicked = _.find(rawData, {Unique_cod: d.points[0].location});
+                if (clicked) {
+                    document.getElementById('districtSelect').value = clicked.District;
+                    updateMandalOptions(false);
+                    document.getElementById('mandalSelect').value = clicked.TEHSIL;
+                    updateDashboard(true);
+                }
+            });
+        });
+    }
+
+    function drawCV() {
+        const cvData = rawData.map(d => {
+            const vals = [];
+            histYears.forEach(yr => vals.push(parseFloat(d[schema.rf + yr])));
+            const mean = _.mean(vals);
+            const std = Math.sqrt(_.sum(vals.map(v => Math.pow(v - mean, 2))) / vals.length);
+            return { name: d.TEHSIL, cv: (std / (mean || 1)) * 100 };
+        });
+        const sorted = _.sortBy(cvData, 'cv').reverse().slice(0, 15);
+        Plotly.newPlot('cvChart', [{x:sorted.map(d=>d.name), y:sorted.map(d=>d.cv), type:'bar', marker:{color:'#8e44ad'}}], {title:'Top 15 Mandals: Rainfall Variability (CV%)'});
+    }
+</script>
+</body>
+</html>
